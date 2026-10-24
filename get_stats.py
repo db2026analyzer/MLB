@@ -7,7 +7,7 @@ import statsapi
 
 START_YEAR = 2017
 END_YEAR = 2026
-MAX_WORKERS = 15  # 並列スレッド数（10〜15程度が最適）
+MAX_WORKERS = 15
 
 
 def normalize_name(text):
@@ -18,8 +18,8 @@ def normalize_name(text):
 
 
 def get_2026_player_ids():
-    """2026年の全選手IDリストを取得"""
-    print("2026年の選手一覧を取得中...")
+    """2026年の全選手IDおよびメインポジションを取得"""
+    print("全選手一覧および基本ポジションを取得中...")
     players = {}
 
     for group in ["hitting", "pitching"]:
@@ -38,16 +38,24 @@ def get_2026_player_ids():
         splits = data.get("stats", [{}])[0].get("splits", [])
         for item in splits:
             p = item.get("player", {})
-            if p.get("id"):
-                players[p.get("id")] = p.get("fullName")
+            p_id = p.get("id")
+            if p_id and p_id not in players:
+                pos = p.get("primaryPosition", {}).get("abbreviation", "DH")
+                players[p_id] = {
+                    "name": p.get("fullName"),
+                    "pos": pos,
+                }
 
     print(f"対象選手数: {len(players)} 名")
     return players
 
 
 def fetch_single_player_data(player_args):
-    """【並列処理用】1選手分の成績・移籍履歴を取得する関数"""
-    player_id, player_name = player_args
+    """1選手分の打撃・投手成績（両方）および移籍履歴を取得"""
+    player_id, p_info = player_args
+    player_name = p_info["name"]
+    default_pos = p_info["pos"]
+
     batting_rows = []
     pitching_rows = []
     transaction_rows = []
@@ -57,7 +65,7 @@ def fetch_single_player_data(player_args):
             "person",
             {
                 "personId": player_id,
-                "hydrate": "stats(type=yearByYear,gameType=R),transactions",
+                "hydrate": "stats(type=yearByYear,gameType=R,group=[hitting,pitching]),transactions",
             },
         )
         people = data.get("people", [])
@@ -65,6 +73,7 @@ def fetch_single_player_data(player_args):
             return batting_rows, pitching_rows, transaction_rows
 
         person = people[0]
+        primary_pos = person.get("primaryPosition", {}).get("abbreviation", default_pos)
 
         # 1. 成績データ
         stats = person.get("stats", [])
@@ -93,12 +102,15 @@ def fetch_single_player_data(player_args):
                     "player_name": player_name,
                     "team_id": team.get("id"),
                     "team_name": team_name,
+                    "pos": primary_pos,
                 }
                 row.update(stat)
 
                 if group_name == "hitting":
                     batting_rows.append(row)
                 elif group_name == "pitching":
+                    if row.get("pos") in ["P", "TWP"]:
+                        row["pos"] = "P"
                     pitching_rows.append(row)
 
         # 2. 移籍・公示履歴
@@ -142,11 +154,8 @@ def main():
     total_players = len(player_dict)
     player_items = list(player_dict.items())
 
-    print(
-        f"\n⚡ {MAX_WORKERS} スレッドで全{total_players}名のデータを高速並列取得中..."
-    )
+    print(f"\n⚡ {MAX_WORKERS} スレッドで全{total_players}名のデータを並列取得中...")
 
-    # ThreadPoolExecutor を使用して並列リクエストを実行
     completed_count = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [
@@ -168,30 +177,50 @@ def main():
     df_trans_all = pd.DataFrame(all_transactions)
 
     print("\n選手名の正規化・重複削除を実行中...")
+    for df in [df_batting_all, df_pitching_all, df_trans_all]:
+        if not df.empty:
+            df["player_name"] = df["player_name"].apply(normalize_name)
+            df.drop_duplicates(inplace=True)
+
+    # 全期間 (2017~2026) の契約初期テーブル (contracts) を作成 (★修正箇所)
+    print("\n全期間 (2017-2026年) の契約・サービスタイム初期枠を作成中...")
+    contract_rows = []
+    all_player_ids = set()
+
     if not df_batting_all.empty:
-        df_batting_all["player_name"] = df_batting_all["player_name"].apply(
-            normalize_name
-        )
-        df_batting_all = df_batting_all.drop_duplicates()
+        for p_id, p_name in (
+            df_batting_all[["player_id", "player_name"]]
+            .drop_duplicates()
+            .itertuples(index=False)
+        ):
+            all_player_ids.add((p_id, p_name))
 
     if not df_pitching_all.empty:
-        df_pitching_all["player_name"] = df_pitching_all["player_name"].apply(
-            normalize_name
-        )
-        df_pitching_all = df_pitching_all.drop_duplicates()
+        for p_id, p_name in (
+            df_pitching_all[["player_id", "player_name"]]
+            .drop_duplicates()
+            .itertuples(index=False)
+        ):
+            all_player_ids.add((p_id, p_name))
 
-    if not df_trans_all.empty:
-        df_trans_all["player_name"] = df_trans_all["player_name"].apply(normalize_name)
-        df_trans_all = df_trans_all.drop_duplicates()
+    for p_id, p_name in all_player_ids:
+        for yr in range(START_YEAR, END_YEAR + 1):
+            contract_rows.append(
+                {
+                    "player_id": int(p_id),
+                    "player_name": p_name,
+                    "season": yr,
+                    "salary": 780000.0,
+                    "aav": 780000.0,
+                    "service_time": f"{max(0, yr - START_YEAR)}.000",
+                    "contract_years": 1,
+                    "free_agent_year": yr + 3,
+                }
+            )
 
-    # CSV保存
-    df_batting_all.to_csv(
-        "mlb_batting_stats_2017_2026.csv", index=False, encoding="utf-8-sig"
+    df_contracts_all = pd.DataFrame(contract_rows).drop_duplicates(
+        subset=["player_id", "season"]
     )
-    df_pitching_all.to_csv(
-        "mlb_pitching_stats_2017_2026.csv", index=False, encoding="utf-8-sig"
-    )
-    df_trans_all.to_csv("mlb_transactions.csv", index=False, encoding="utf-8-sig")
 
     # SQLite保存
     conn = sqlite3.connect("mlb_player_stats.db")
@@ -199,6 +228,7 @@ def main():
     df_pitching_all.to_sql("pitching_stats", conn, if_exists="replace", index=False)
     df_trans_all.to_sql("transactions", conn, if_exists="replace", index=False)
     df_trans_all.to_sql("team_transactions", conn, if_exists="replace", index=False)
+    df_contracts_all.to_sql("contracts", conn, if_exists="replace", index=False)
     conn.close()
 
     elapsed_time = round(time.time() - start_time, 2)
@@ -206,7 +236,7 @@ def main():
     print(f"🎉 高速取得完了！ (所要時間: {elapsed_time} 秒)")
     print(f"・打者成績: {len(df_batting_all)} 行")
     print(f"・投手成績: {len(df_pitching_all)} 行")
-    print(f"・全公示・移籍履歴: {len(df_trans_all)} 行")
+    print(f"・全期間契約データ: {len(df_contracts_all)} 行")
     print("==========================================")
 
 
