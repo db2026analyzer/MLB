@@ -65,7 +65,7 @@ def fetch_single_player_data(player_args):
             "person",
             {
                 "personId": player_id,
-                "hydrate": "stats(type=yearByYear,gameType=R,group=[hitting,pitching]),transactions",
+                "hydrate": "stats(type=[yearByYear,statSplits],gameType=R,group=[hitting,pitching]),transactions",
             },
         )
         people = data.get("people", [])
@@ -75,12 +75,30 @@ def fetch_single_player_data(player_args):
         person = people[0]
         primary_pos = person.get("primaryPosition", {}).get("abbreviation", default_pos)
 
-        # 1. 成績データ
+        # 選手が就いたすべてのポジションを全期間から収集
+        all_positions = []
         stats = person.get("stats", [])
         for stat_group in stats:
-            group_name = stat_group.get("group", {}).get("displayName")
-            splits = stat_group.get("splits", [])
+            for item in stat_group.get("splits", []):
+                p_code = item.get("position", {}).get("abbreviation")
+                if (
+                    p_code
+                    and p_code not in ["P", "TWP", "DH"]
+                    and p_code not in all_positions
+                ):
+                    all_positions.append(p_code)
 
+        # 複数ポジション文字列の作成 (例: "SS, 3B, 2B")
+        pos_str_combined = ", ".join(all_positions) if all_positions else primary_pos
+
+        # 1. 成績データ
+        for stat_group in stats:
+            group_name = stat_group.get("group", {}).get("displayName")
+            type_name = stat_group.get("type", {}).get("displayName")
+            if type_name != "yearByYear":
+                continue
+
+            splits = stat_group.get("splits", [])
             for item in splits:
                 season = item.get("season")
                 if not season:
@@ -96,13 +114,14 @@ def fetch_single_player_data(player_args):
                     continue
 
                 stat = item.get("stat", {})
+
                 row = {
                     "season": season_num,
                     "player_id": player_id,
                     "player_name": player_name,
                     "team_id": team.get("id"),
                     "team_name": team_name,
-                    "pos": primary_pos,
+                    "pos": pos_str_combined,  # 複数ポジション情報を設定
                 }
                 row.update(stat)
 
@@ -182,7 +201,6 @@ def main():
             df["player_name"] = df["player_name"].apply(normalize_name)
             df.drop_duplicates(inplace=True)
 
-    # 全期間 (2017~2026) の契約初期テーブル (contracts) を作成 (★修正箇所)
     print("\n全期間 (2017-2026年) の契約・サービスタイム初期枠を作成中...")
     contract_rows = []
     all_player_ids = set()
